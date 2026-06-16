@@ -16,7 +16,7 @@ import os
 
 from dotenv import load_dotenv
 from groq import Groq
-
+import re
 from utils.data_loader import load_listings
 
 load_dotenv()
@@ -70,9 +70,74 @@ def search_listings(
     Before writing code, fill in the Tool 1 section of planning.md.
     """
     # Replace this with your implementation
-    return []
+    listings = load_listings()
 
 
+    # Turn the user's description into lowercase keywords.
+    query_words = set(
+        re.findall(r"[a-z0-9]+", description.lower())
+    )
+
+    scored_listings = []
+
+    for listing in listings:
+        # Filter by maximum price when provided.
+        if (
+            max_price is not None
+            and listing["price"] > max_price
+        ):
+            continue
+
+        # Filter by size when provided.
+        if size is not None:
+            requested_size = size.strip().lower()
+            listing_size = listing["size"].strip().lower()
+
+            # Allows "M" to match a listing size such as "S/M".
+            available_sizes = [
+                part.strip()
+                for part in listing_size.split("/")
+            ]
+
+            if (
+                requested_size != listing_size
+                and requested_size not in available_sizes
+            ):
+                continue
+
+        # Combine the searchable listing fields into one string.
+        searchable_text = " ".join([
+            listing.get("title", ""),
+            listing.get("description", ""),
+            listing.get("category", ""),
+            " ".join(listing.get("style_tags", [])),
+            " ".join(listing.get("colors", [])),
+            listing.get("brand") or "",
+            listing.get("platform", ""),
+        ]).lower()
+
+        listing_words = set(
+            re.findall(r"[a-z0-9]+", searchable_text)
+        )
+
+        # Score based on how many query words appear in the listing.
+        score = len(query_words & listing_words)
+
+        # Do not include unrelated listings.
+        if score > 0:
+            scored_listings.append((score, listing))
+
+    # Highest keyword score first.
+    # Lower price breaks ties and keeps results deterministic.
+    scored_listings.sort(
+        key=lambda result: (-result[0], result[1]["price"])
+    )
+
+    # Return only the listing dictionaries, up to three results.
+    return [
+        listing
+        for score, listing in scored_listings[:3]
+    ]
 # ── Tool 2: suggest_outfit ────────────────────────────────────────────────────
 
 def suggest_outfit(new_item: dict, wardrobe: dict) -> str:
@@ -101,7 +166,82 @@ def suggest_outfit(new_item: dict, wardrobe: dict) -> str:
     Before writing code, fill in the Tool 2 section of planning.md.
     """
     # Replace this with your implementation
-    return ""
+    """
+    Given a thrifted item and the user's wardrobe, suggest 1–2 complete outfits.
+    """
+    wardrobe_items = wardrobe.get("items", [])
+
+    if not wardrobe_items:
+        prompt = f"""
+You are a personal stylist.
+
+The user is considering buying this item:
+
+{new_item}
+
+The user's wardrobe is empty.
+
+Suggest 1 or 2 general outfit ideas for this item. Explain what types of
+tops, bottoms, shoes, outerwear, or accessories would pair well with it.
+
+Do not claim that the user already owns any of the suggested pieces.
+Clearly explain that these are general styling ideas.
+"""
+    else:
+        wardrobe_text = "\n".join(
+            f"- {item['name']} | "
+            f"Category: {item['category']} | "
+            f"Colors: {', '.join(item['colors'])} | "
+            f"Style: {', '.join(item['style_tags'])} | "
+            f"Notes: {item.get('notes') or 'None'}"
+            for item in wardrobe_items
+        )
+
+        prompt = f"""
+You are a personal stylist.
+
+The user is considering buying this item:
+
+{new_item}
+
+The user already owns these clothes:
+
+{wardrobe_text}
+
+Suggest 1 or 2 complete outfits using the new item and named pieces from
+the wardrobe.
+
+Requirements:
+- Include the new item in every outfit.
+- Use only wardrobe pieces listed above.
+- Refer to wardrobe pieces by their names.
+- Explain how to wear the pieces together.
+- Describe the style or vibe.
+- If the wardrobe has limited options, create the best outfit possible
+  and explain that the choices are limited.
+"""
+
+    try:
+        client = _get_groq_client()
+
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt,
+                }
+            ],
+            temperature=0.7,
+        )
+        outfit_suggestion = response.choices[0].message.content
+        if not outfit_suggestion or not outfit_suggestion.strip():
+            return "The styling service did not return an outfit suggestion."
+
+        return outfit_suggestion.strip()
+
+    except Exception as error:
+        return f"Unable to generate an outfit suggestion: {error}"
 
 
 # ── Tool 3: create_fit_card ───────────────────────────────────────────────────
@@ -134,4 +274,74 @@ def create_fit_card(outfit: str, new_item: dict) -> str:
     Before writing code, fill in the Tool 3 section of planning.md.
     """
     # Replace this with your implementation
-    return ""
+
+    # Do not call the LLM if there is no valid outfit.
+    if not outfit or not outfit.strip():
+        return (
+            "Unable to create a fit card because a complete outfit "
+            "suggestion is required."
+        )
+
+    item_title = new_item.get("title", "thrifted item")
+    item_price = new_item.get("price")
+    item_platform = new_item.get("platform")
+
+    price_text = (
+        f"${item_price}"
+        if item_price is not None
+        else "an unknown price"
+    )
+
+    platform_text = (
+        item_platform
+        if item_platform
+        else "a secondhand platform"
+    )
+
+    prompt = f"""
+You are writing a short social-media caption for an outfit post.
+
+Thrifted item:
+- Item name: {item_title}
+- Price: {price_text}
+- Platform: {platform_text}
+
+Complete outfit:
+{outfit}
+
+Write a 2–4 sentence Instagram or TikTok caption.
+
+Requirements:
+- Sound casual and authentic, like a real OOTD post.
+- Do not sound like a product advertisement.
+- Mention the item name once.
+- Mention the price once.
+- Mention the platform once.
+- Describe the specific style or vibe of the outfit.
+- Keep it short and shareable.
+"""
+
+    try:
+        client = _get_groq_client()
+
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt,
+                }
+            ],
+            temperature=0.9,
+        )
+
+        caption = response.choices[0].message.content
+
+        if not caption or not caption.strip():
+            return "The caption generator did not return a fit card."
+
+        return caption.strip()
+
+    except Exception as error:
+        return f"Unable to create the fit card: {error}"
+
